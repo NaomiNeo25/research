@@ -269,17 +269,17 @@ datasets = {
 }
 
 #Check if all models work one by one
-model_classes = [
-    RCNN,
-]
-
 # model_classes = [
-#     BLSTM2DCNN, BLSTM2DCNNWithAttention, ParallelBLSTMCNNWithAttention, HAN, BLSTM2DCNNWithMultiHeadAttention, RCNN
+#     RCNN,
 # ]
+
+model_classes = [
+    BLSTM2DCNN, BLSTM2DCNNWithAttention, ParallelBLSTMCNNWithAttention, HAN, BLSTM2DCNNWithMultiHeadAttention, RCNN
+]
 
 # Run experiments first with FastText, then with BPE embeddings
 logger.info("Starting experiments with FastText embeddings...")
-#results_fasttext = run_experiment(model_classes, datasets, embedding_type="FastText")
+results_fasttext = run_experiment(model_classes, datasets, embedding_type="FastText")
 
 logger.info("\nStarting experiments with BPE embeddings...")
 results_bpe = run_experiment(model_classes, datasets, embedding_type="BPE")
