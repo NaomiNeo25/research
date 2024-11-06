@@ -14,8 +14,12 @@ vocab_size = sp.piece_size()
 
 # Define Dataset Classes
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger('DLP')
+
+# Then replace all instances of:
+logging.info("message")
+# with:
+logger.info("message")
 
 
 class BaseDataset(Dataset):
@@ -242,27 +246,37 @@ class Blog50Dataset(BaseDataset):
         return author_posts
 
     def _process_authors(self, author_posts):
-        """Process authors and ensure consecutive label indexing."""
+        """Process authors to include those with exactly 5 posts and those with more, taking up to 5 posts each."""
         # Get authors with post counts
         author_counts = [(author, len(posts)) for author, posts in author_posts.items()]
         logger.info(f"Author post counts: min={min(c for _, c in author_counts)}, "
                     f"max={max(c for _, c in author_counts)}, "
                     f"mean={sum(c for _, c in author_counts) / len(author_counts):.1f}")
 
-        # Select top 50 authors
-        top_authors = sorted(author_counts, key=lambda x: x[1], reverse=True)[:50]
-        logger.info(f"Selected top 50 authors with post counts from "
-                    f"{top_authors[-1][1]} to {top_authors[0][1]}")
+        # Select authors who have exactly 5 posts
+        authors_with_exactly_5 = [(author, count) for author, count in author_counts if count == 5]
+        # Select authors who have more than 5 posts
+        authors_with_more_than_5 = [(author, count) for author, count in author_counts if count > 5]
+
+        # Log the number of authors in each category
+        num_authors_exactly_5 = len(authors_with_exactly_5)
+        num_authors_more_than_5 = len(authors_with_more_than_5)
+        logger.info(f"Authors with exactly 5 posts: {num_authors_exactly_5}")
+        logger.info(f"Authors with more than 5 posts: {num_authors_more_than_5}")
+
+        # Combine the authors
+        selected_authors = authors_with_exactly_5 + authors_with_more_than_5
+        logger.info(f"Total selected authors: {len(selected_authors)}")
 
         # Create consecutive label mapping
-        self.author_to_idx = {author: idx for idx, (author, _) in enumerate(top_authors)}
+        self.author_to_idx = {author: idx for idx, (author, _) in enumerate(selected_authors)}
 
         # Collect texts and labels
         self.texts = []
         self.labels = []
-        for author, _ in top_authors:
-            # Get up to 50 posts per author
-            posts = author_posts[author][:50]
+        for author, _ in selected_authors:
+            # Get up to 5 posts per author
+            posts = author_posts[author][:5]
             self.texts.extend(posts)
             self.labels.extend([self.author_to_idx[author]] * len(posts))
 
@@ -366,29 +380,6 @@ def _verify_dataset(dataset):
     return True
 
 
-# Example usage for testing the dataset
-if __name__ == "__main__":
-    import sys
-    from collections import Counter
-
-    if len(sys.argv) != 2:
-        print("Usage: python blog_dataset.py <path_to_blog_data>")
-        sys.exit(1)
-
-    # Initialize tokenizer
-    sp = spm.SentencePieceProcessor()
-    sp.Load('bpe.model')
-
-    # Create and verify dataset
-    try:
-        dataset = Blog50Dataset(sys.argv[1], sp)
-        if _verify_dataset(dataset):
-            print("\nDataset verification passed!")
-        else:
-            print("\nDataset verification failed!")
-    except Exception as e:
-        print(f"\nError creating dataset: {str(e)}")
-
 def get_dataloaders(dataset_class, dataset_args, batch_size=32, val_split=0.1):
     """Create train, validation, and test dataloaders with proper splits."""
     try:
@@ -453,5 +444,6 @@ def collate_fn(batch):
         end = lengths[i]
         padded_texts[i, :end] = text[:end]
     labels = torch.tensor(labels, dtype=torch.long)
-    return padded_texts, labels
+    lengths = torch.tensor(lengths, dtype=torch.long)
+    return padded_texts, labels, lengths
 

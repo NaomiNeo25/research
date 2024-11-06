@@ -13,7 +13,7 @@ import fasttext
 import fasttext.util
 
 # Set up directories
-SAVE_DIR = "./experiment_results/"
+SAVE_DIR = "./experiment_results/BlogsDataset/"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # Set up logging
@@ -70,10 +70,12 @@ def initialize_model(model_class, embedding, num_classes):
 
 # Function for training a model
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler):
+    step = 0  # Initialize step counter
     for epoch in range(NUM_EPOCHS):
         model.train()
         total_loss = 0
         all_preds, all_labels = [], []
+
         for inputs, labels, lengths in train_loader:
             inputs, labels, lengths = inputs.to(DEVICE), labels.to(DEVICE), lengths.to(DEVICE)
             optimizer.zero_grad()
@@ -81,16 +83,61 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+
+            # Update total loss
             total_loss += loss.item()
+
+            # Predictions and labels for this batch
             _, preds = torch.max(outputs, 1)
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+            batch_preds = preds.cpu().numpy()
+            batch_labels = labels.cpu().numpy()
+
+            # Update overall predictions and labels
+            all_preds.extend(batch_preds)
+            all_labels.extend(batch_labels)
+
+            # Calculate batch accuracy
+            batch_acc = accuracy_score(batch_labels, batch_preds)
+            # Optional: Calculate batch F1-score
+            # batch_f1 = f1_score(batch_labels, batch_preds, average="weighted")
+
+            # Log after each batch
+            logging.info(
+                f"Epoch [{epoch + 1}/{NUM_EPOCHS}], "
+                f"Step [{step + 1}/{len(train_loader)}], "
+                f"Loss: {loss.item():.4f}, "
+                f"Batch Accuracy: {batch_acc:.4f}"
+                # f", Batch F1: {batch_f1:.4f}"  # Uncomment if you wish to log batch F1-score
+            )
+
+            # Update step counter
+            step += 1
+
+        # Scheduler step (you can decide whether to step per batch or per epoch)
         scheduler.step(total_loss)
 
+        # Epoch-level metrics
+        epoch_acc = accuracy_score(all_labels, all_preds)
+        epoch_f1 = f1_score(all_labels, all_preds, average="weighted")
+
         # Validation
-        model.eval()
         val_loss, val_acc, val_f1 = evaluate_model(model, val_loader, criterion)
-        logging.info(f"Epoch {epoch + 1}/{NUM_EPOCHS} - Loss: {total_loss:.4f} Val Loss: {val_loss:.4f} Acc: {val_acc:.4f} F1: {val_f1:.4f}")
+
+        logging.info(
+            f"Epoch [{epoch + 1}/{NUM_EPOCHS}] Completed. "
+            f"Training Loss: {total_loss / len(train_loader):.4f}, "
+            f"Training Accuracy: {epoch_acc:.4f}, "
+            f"Training F1: {epoch_f1:.4f}"
+        )
+        logging.info(
+            f"Validation Loss: {val_loss:.4f}, "
+            f"Validation Accuracy: {val_acc:.4f}, "
+            f"Validation F1: {val_f1:.4f}"
+        )
+
+        # Reset step counter after each epoch
+        step = 0
+
     return model
 
 # Function for evaluating a model
@@ -174,15 +221,17 @@ def run_experiment(model_classes, datasets, embedding_type="FastText"):
 
 # Define datasets and models with root directories/files
 datasets = {
-    "Reuters": {"class": Reuters50Dataset, "args": {"root_dir": './datasets/reuter+50+50', "sp_model": sp, "max_seq_length": 512}},
-    "IMDB": {"class": IMDb62Dataset, "args": {"data_file": './datasets/imdb62/imdb62.txt', "sp_model": sp, "max_seq_length": 512}},
-    "Guardian": {"class": GuardianDataset, "args": {"root_dir": './datasets/Guardian/Guardian_original', "sp_model": sp, "max_seq_length": 512}},
     "Blogs": {"class": Blog50Dataset, "args": {"root_dir": './datasets/blogs', "sp_model": sp, "max_seq_length": 512}}
 }
 
+#Check if all models work one by one
 model_classes = [
-    BLSTM2DCNN, BLSTM2DCNNWithAttention, ParallelBLSTMCNNWithAttention, HAN, TextCNN, BLSTM2DCNNWithMultiHeadAttention, RCNN
+    BLSTM2DCNN,
 ]
+
+# model_classes = [
+#     BLSTM2DCNN, BLSTM2DCNNWithAttention, ParallelBLSTMCNNWithAttention, HAN, TextCNN, BLSTM2DCNNWithMultiHeadAttention, RCNN
+# ]
 
 # Run experiments first with FastText, then with BPE embeddings
 logging.info("Starting experiments with FastText embeddings...")

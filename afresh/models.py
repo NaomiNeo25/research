@@ -1,9 +1,35 @@
 import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+class TextCNN(nn.Module):
+    def __init__(self, embedding_layer=None, num_classes=None, vocab_size=None, embed_dim=None, kernel_sizes=[3, 4, 5], num_filters=100):
+        super(TextCNN, self).__init__()
+        if embedding_layer is not None:
+            self.embedding = embedding_layer
+            embed_dim = embedding_layer.embedding_dim
+        else:
+            if vocab_size is None or embed_dim is None:
+                raise ValueError("vocab_size and embed_dim must be provided if embedding_layer is None")
+            self.embedding = nn.Embedding(vocab_size, embed_dim)
+        self.convs = nn.ModuleList([
+            nn.Conv2d(1, num_filters, (k, embed_dim)) for k in kernel_sizes
+        ])
+        self.dropout = nn.Dropout(0.5)
+        if num_classes is None:
+            raise ValueError("num_classes must be provided")
+        self.fc = nn.Linear(len(kernel_sizes) * num_filters, num_classes)
+
+    def forward(self, x, lengths=None):
+        x = self.embedding(x)  # (batch_size, seq_len, embed_dim)
+        x = x.unsqueeze(1)  # (batch_size, 1, seq_len, embed_dim)
+        conv_outs = [F.relu(conv(x)).squeeze(3) for conv in self.convs]  # [(batch_size, num_filters, seq_len-k+1), ...]
+        pooled_outs = [F.max_pool1d(out, out.size(2)).squeeze(2) for out in conv_outs]  # [(batch_size, num_filters), ...]
+        concat = torch.cat(pooled_outs, dim=1)  # (batch_size, num_filters * len(kernel_sizes))
+        dropped = self.dropout(concat)
+        out = self.fc(dropped)
+        return out
 
 class GaussianNoise(nn.Module):
     """Gaussian noise regularizer."""
@@ -18,7 +44,6 @@ class GaussianNoise(nn.Module):
             return x + noise
         return x
 
-
 class BaseModel(nn.Module):
     """Base class for all models with common initialization."""
 
@@ -27,73 +52,145 @@ class BaseModel(nn.Module):
 
     def _initialize_weights(self):
         for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                n = m.kernel_size[0] * m.kernel_size[1] * m.out_channels
-                m.weight.data.normal_(0, math.sqrt(2. / n))
+            if isinstance(m, nn.Conv2d) or isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
-                    m.bias.data.zero_()
-            elif isinstance(m, nn.BatchNorm2d):
-                m.weight.data.fill_(1)
-                m.bias.data.zero_()
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.LSTM):
+                for name, param in m.named_parameters():
+                    if 'weight_ih' in name:
+                        nn.init.xavier_uniform_(param.data)
+                    elif 'weight_hh' in name:
+                        nn.init.orthogonal_(param.data)
+                    elif 'bias' in name:
+                        nn.init.zeros_(param.data)
             elif isinstance(m, nn.Linear):
-                m.weight.data.normal_(0, 0.01)
-                m.bias.data.zero_()
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
 
+class RCNN(BaseModel):
+    def __init__(self, embedding_layer, num_classes, hidden_dim=128):
+        super().__init__()
+        self.embedding = embedding_layer
+        self.lstm = nn.LSTM(
+            embedding_layer.embedding_dim,
+            hidden_dim,
+            bidirectional=True,
+            batch_first=True
+        )
+
+        # Concatenated dimension will be embedding_dim + 2*hidden_dim
+        total_dim = embedding_layer.embedding_dim + 2 * hidden_dim
+
+        # Conv layer
+        self.conv = nn.Conv1d(total_dim, hidden_dim, kernel_size=3, padding=1)
+
+        # Add adaptive pooling for fixed output size
+        self.adaptive_pool = nn.AdaptiveAvgPool1d(8)
+
+        # Dropout for regularization
+        self.dropout = nn.Dropout(0.5)
+
+        # Final classification layer
+        self.fc = nn.Linear(hidden_dim * 8, num_classes)
+
+        self._initialize_weights()
+
+    def forward(self, x, lengths):
+        batch_size = x.size(0)
+
+        # Embedding
+        x_embed = self.embedding(x)  # (batch_size, seq_len, embed_dim)
+
+        # Pack padded sequence for LSTM
+        packed_embed = nn.utils.rnn.pack_padded_sequence(
+            x_embed,
+            lengths.cpu(),
+            batch_first=True,
+            enforce_sorted=False
+        )
+
+        # LSTM
+        packed_output, _ = self.lstm(packed_embed)
+        lstm_out, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_output,
+            batch_first=True
+        )  # (batch_size, seq_len, 2*hidden_dim)
+
+        # Concatenate embedding and LSTM outputs
+        combined = torch.cat((x_embed, lstm_out), dim=2)  # (batch_size, seq_len, embed_dim + 2*hidden_dim)
+
+        # Prepare for conv1d by changing dimension order
+        combined = combined.permute(0, 2, 1)  # (batch_size, embed_dim + 2*hidden_dim, seq_len)
+
+        # Apply convolution
+        conv_out = F.relu(self.conv(combined))  # (batch_size, hidden_dim, seq_len)
+
+        # Apply adaptive pooling for fixed output size
+        pooled = self.adaptive_pool(conv_out)  # (batch_size, hidden_dim, 8)
+
+        # Flatten and apply dropout
+        flattened = pooled.view(batch_size, -1)  # (batch_size, hidden_dim * 8)
+        dropped = self.dropout(flattened)
+
+        # Classification
+        output = self.fc(dropped)
+
+        return output
 
 class BLSTM2DCNN(BaseModel):
     def __init__(self, embedding_layer, num_classes, hidden_dim=128):
         super().__init__()
         self.embedding = embedding_layer
-        self.gaussian_noise = GaussianNoise(0.2)
         self.dropout_embed = nn.Dropout(0.5)
 
-        # BLSTM layer with proper number of layers and dropout
+        # BLSTM layer
         self.blstm = nn.LSTM(
-            input_size=300,  # embedding dimension
+            input_size=embedding_layer.embedding_dim,  # embedding dimension
             hidden_size=hidden_dim,
-            num_layers=2,  # Add multiple layers to properly use dropout
+            num_layers=2,
             batch_first=True,
             bidirectional=True,
             dropout=0.3
         )
 
-        # CNN layers with proper dimensionality
+        # CNN layers
         self.conv1 = nn.Conv2d(1, 100, kernel_size=(3, 3), padding=1)
         self.conv2 = nn.Conv2d(100, 100, kernel_size=(3, 3), padding=1)
         self.pool = nn.MaxPool2d(kernel_size=(2, 2))
         self.dropout_penultimate = nn.Dropout(0.2)
 
-        # Adaptive pooling to handle variable sequence lengths
+        # Adaptive pooling
         self.adaptive_pool = nn.AdaptiveAvgPool2d((4, 4))
 
-        # Calculate final output size
+        # Calculate the size of the fully connected layer input
         with torch.no_grad():
-            # Create dummy input to calculate output size
-            x = torch.zeros(1, 1, 64, hidden_dim * 2)
-            x = self.conv1(x)
-            x = F.relu(x)
-            x = self.conv2(x)
-            x = F.relu(x)
-            x = self.pool(x)
-            x = self.adaptive_pool(x)
-            self.fc_input_size = x.numel()
+            sample_input = torch.zeros(1, 1, 50, hidden_dim * 2)
+            sample_output = self.conv_layers(sample_input)
+            self.fc_input_size = sample_output.view(-1).size(0)
 
         self.fc = nn.Linear(self.fc_input_size, num_classes)
         self._initialize_weights()
 
-    def forward(self, x):
-        # Get batch size and sequence length
-        batch_size, seq_len = x.size()
+    def conv_layers(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = self.pool(x)
+        x = self.adaptive_pool(x)
+        return x
 
-        # Embedding and noise
+    def forward(self, x, lengths):
+        # x: (batch_size, seq_len)
+        batch_size = x.size(0)
+
+        # Embedding
         x = self.embedding(x)  # (batch_size, seq_len, embed_dim)
-        x = self.gaussian_noise(x)
         x = self.dropout_embed(x)
 
-        # Pack padded sequence for LSTM
+        # Pack sequence
         packed_x = nn.utils.rnn.pack_padded_sequence(
             x,
-            lengths=[seq_len] * batch_size,
+            lengths=lengths.cpu(),
             batch_first=True,
             enforce_sorted=False
         )
@@ -106,75 +203,98 @@ class BLSTM2DCNN(BaseModel):
         )  # (batch_size, seq_len, hidden_dim * 2)
 
         # Reshape for CNN
-        cnn_in = lstm_out.unsqueeze(1)  # (batch_size, 1, seq_len, hidden_dim * 2)
+        lstm_out = lstm_out.unsqueeze(1)  # (batch_size, 1, seq_len, hidden_dim * 2)
 
         # CNN layers
-        conv1_out = F.relu(self.conv1(cnn_in))
-        conv2_out = F.relu(self.conv2(conv1_out))
-        pooled = self.pool(conv2_out)
+        conv_out = self.conv_layers(lstm_out)
 
-        # Adaptive pooling to handle variable sequence lengths
-        pooled = self.adaptive_pool(pooled)
-
-        # Flatten and apply dropout
-        flattened = pooled.view(batch_size, -1)
+        # Flatten and dropout
+        flattened = conv_out.view(batch_size, -1)
         dropped = self.dropout_penultimate(flattened)
 
-        # Final classification
+        # Fully connected layer
         out = self.fc(dropped)
 
         return out
 
-    def _initialize_weights(self):
-        """Initialize model weights."""
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.BatchNorm2d):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-            elif isinstance(m, nn.Linear):
-                nn.init.normal_(m.weight, 0, 0.01)
-                nn.init.constant_(m.bias, 0)
+class BLSTM2DCNNWithAttention(BaseModel):
+    def __init__(self, embedding_layer, num_classes, hidden_dim=128):
+        super().__init__()
+        self.embedding = embedding_layer
+        self.gaussian_noise = GaussianNoise(0.2)
+        self.dropout_embed = nn.Dropout(0.5)
 
+        # BLSTM layer
+        self.blstm = nn.LSTM(
+            input_size=embedding_layer.embedding_dim,
+            hidden_size=hidden_dim,
+            num_layers=2,
+            batch_first=True,
+            bidirectional=True,
+            dropout=0.3
+        )
 
-class BLSTM2DCNNWithAttention(nn.Module):
-    def __init__(self, vocab_size, embedding_dim, hidden_dim, output_dim, dropout_rate=0.5):
-        super(BLSTM2DCNNWithAttention, self).__init__()
-        self.embedding = nn.Embedding(vocab_size, embedding_dim)
-        self.attention = nn.Linear(embedding_dim, 1)
-        self.blstm = nn.LSTM(embedding_dim, hidden_dim, batch_first=True, bidirectional=True)
-        self.conv = nn.Conv2d(1, 128, kernel_size=(3, hidden_dim * 2))
+        # Attention mechanism
+        self.attention = nn.Linear(hidden_dim * 2, 1)
+
+        # CNN layers
+        self.conv = nn.Conv2d(1, 128, kernel_size=(3, hidden_dim * 2), padding=(1, 0))
         self.pool = nn.MaxPool2d(kernel_size=(2, 1))
-        self.fc = nn.Linear(128, output_dim)
-        self.dropout = nn.Dropout(dropout_rate)
-        self.softmax = nn.Softmax(dim=1)
+        self.dropout_penultimate = nn.Dropout(0.2)
 
-    def forward(self, x):
-        # Embedding
-        embeds = self.embedding(x)  # (batch_size, seq_length, embedding_dim)
+        # Add adaptive pooling to ensure fixed output size
+        self.adaptive_pool = nn.AdaptiveAvgPool1d(8)  # Fixed output size
 
-        # Attention over embeddings
-        attn_weights = F.softmax(self.attention(embeds), dim=1)  # (batch_size, seq_length, 1)
-        embeds = embeds * attn_weights  # Element-wise multiplication
+        # Calculate fc_input_size based on fixed output dimensions
+        self.fc_input_size = 128 * 8  # 128 channels * 8 (adaptive pooling output size)
+
+        # Output layer
+        self.fc = nn.Linear(self.fc_input_size, num_classes)
+        self._initialize_weights()
+
+    def forward(self, x, lengths):
+        batch_size = x.size(0)
+
+        # Embedding and noise
+        x_embedded = self.embedding(x)
+        x_noisy = self.gaussian_noise(x_embedded)
+        x_embedded = self.dropout_embed(x_noisy)
+
+        # Pack sequence
+        packed_embedded = nn.utils.rnn.pack_padded_sequence(
+            x_embedded, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
 
         # BLSTM
-        blstm_out, _ = self.blstm(embeds)
-        blstm_out = blstm_out.unsqueeze(1)  # (batch_size, 1, seq_length, hidden_dim * 2)
+        packed_output, _ = self.blstm(packed_embedded)
+        lstm_out, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_output, batch_first=True
+        )  # (batch_size, seq_len, hidden_dim * 2)
 
-        # 2D CNN
-        conv_out = F.relu(self.conv(blstm_out))
-        pooled = self.pool(conv_out).squeeze(3).squeeze(2)
+        # Attention mechanism
+        attention_scores = self.attention(lstm_out)  # (batch_size, seq_len, 1)
+        attention_weights = F.softmax(attention_scores.squeeze(-1), dim=1).unsqueeze(2)  # (batch_size, seq_len, 1)
+        attended = lstm_out * attention_weights  # (batch_size, seq_len, hidden_dim * 2)
+
+        # Prepare for CNN
+        cnn_in = attended.unsqueeze(1)  # (batch_size, 1, seq_len, hidden_dim * 2)
+
+        # CNN and pooling
+        conv_out = F.relu(self.conv(cnn_in))  # (batch_size, 128, seq_len, 1)
+        conv_out = self.pool(conv_out)  # (batch_size, 128, seq_len/2, 1)
+        conv_out = conv_out.squeeze(-1)  # (batch_size, 128, seq_len/2)
+
+        # Adaptive pooling to ensure fixed output size
+        conv_out = self.adaptive_pool(conv_out)  # (batch_size, 128, 8)
+
+        # Flatten and apply dropout
+        flattened = conv_out.view(batch_size, -1)  # (batch_size, 128 * 8)
+        dropped = self.dropout_penultimate(flattened)
 
         # Classification
-        output = self.dropout(pooled)
-        output = self.fc(output)
-        output = self.softmax(output)
+        output = self.fc(dropped)
 
         return output
-
 
 class ParallelBLSTMCNNWithAttention(BaseModel):
     def __init__(self, embedding_layer, num_classes, hidden_dim=128):
@@ -185,314 +305,235 @@ class ParallelBLSTMCNNWithAttention(BaseModel):
 
         # BLSTM branch
         self.blstm = nn.LSTM(
-            input_size=300,
+            input_size=embedding_layer.embedding_dim,
             hidden_size=hidden_dim,
+            num_layers=2,
             batch_first=True,
             bidirectional=True,
             dropout=0.3
         )
 
         # CNN branch
-        self.conv = nn.Conv2d(1, 128, kernel_size=(3, 3), padding=1)
-        self.pool = nn.MaxPool2d(kernel_size=(2, 2))
+        self.conv = nn.Conv2d(1, 128, kernel_size=(3, embedding_layer.embedding_dim), padding=(1, 0))
+        self.pool = nn.MaxPool2d(kernel_size=(2, 1))
+        self.adaptive_pool = nn.AdaptiveAvgPool2d((1, 4))  # Output size: (channels, 4)
 
-        # Attention mechanism
-        self.attention = nn.Linear(hidden_dim * 2 + 128, 1)
+        # Compute the output dimension after CNN branch for combining features
+        conv_out_dim = 128 * 4  # 128 channels * 4 (from adaptive pooling)
+
+        # Attention mechanism over combined features
+        combined_dim = hidden_dim * 2 + conv_out_dim
+        self.attention = nn.Sequential(
+            nn.Linear(combined_dim, combined_dim),
+            nn.Tanh(),
+            nn.Linear(combined_dim, combined_dim),
+            nn.Softmax(dim=1)
+        )
 
         # Output layer
         self.dropout_penultimate = nn.Dropout(0.2)
-        self.fc = nn.Linear(hidden_dim * 2 + 128, num_classes)
+        self.fc = nn.Linear(combined_dim, num_classes)
         self._initialize_weights()
 
-    def forward(self, x):
+    def conv_layers(self, x):
+        x = F.relu(self.conv(x))
+        x = self.pool(x)
+        x = self.adaptive_pool(x)  # Shape: (batch_size, 128, 1, 4)
+        x = x.squeeze(2)  # Remove the height dimension, shape: (batch_size, 128, 4)
+        x = x.view(x.size(0), -1)  # Flatten to (batch_size, 128 * 4)
+        return x
+
+    def forward(self, x, lengths):
+        batch_size = x.size(0)
+
         # Embedding and noise
-        x = self.embedding(x)
-        x = self.gaussian_noise(x)
-        x = self.dropout_embed(x)
+        x_embedded = self.embedding(x)
+        x_noisy = self.gaussian_noise(x_embedded)
+        x_embedded = self.dropout_embed(x_noisy)
 
         # BLSTM branch
-        lstm_out, _ = self.blstm(x)
+        packed_embedded = nn.utils.rnn.pack_padded_sequence(
+            x_embedded, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        packed_output, (h_n, _) = self.blstm(packed_embedded)
+        # Get the last hidden state from both directions
+        h_n = h_n.view(self.blstm.num_layers, 2, batch_size, self.blstm.hidden_size)
+        h_n_last = h_n[-1]  # Last layer
+        lstm_out = torch.cat((h_n_last[0], h_n_last[1]), dim=1)  # Shape: (batch_size, hidden_dim * 2)
 
         # CNN branch
-        cnn_in = x.unsqueeze(1)
-        conv_out = self.conv(cnn_in)
-        conv_out = F.relu(conv_out)
-        conv_out = self.pool(conv_out)
+        cnn_in = x_embedded.unsqueeze(1)  # Shape: (batch_size, 1, seq_len, embed_dim)
+        cnn_in = cnn_in.permute(0, 1, 3, 2)  # Shape: (batch_size, 1, embed_dim, seq_len)
+        conv_out = self.conv_layers(cnn_in)  # Shape: (batch_size, conv_out_dim)
 
         # Combine features
-        batch_size = x.size(0)
-        conv_out = conv_out.view(batch_size, 128, -1).mean(dim=2)
-        combined = torch.cat((lstm_out[:, -1, :], conv_out), dim=1)
+        combined = torch.cat((lstm_out, conv_out), dim=1)  # Shape: (batch_size, combined_dim)
 
-        # Attention
-        attention_weights = F.softmax(self.attention(combined), dim=1)
-        attended = combined * attention_weights
+        # Attention over combined features
+        attention_weights = self.attention(combined)  # Shape: (batch_size, combined_dim)
+        attended = combined * attention_weights  # Element-wise multiplication
 
         # Classification
         attended = self.dropout_penultimate(attended)
-        out = self.fc(attended)
+        output = self.fc(attended)
 
-        return out
+        return output
 
-class SelfAttention(nn.Module):
-    def __init__(self, hidden_size):
-        super(SelfAttention, self).__init__()
-        self.hidden_size = hidden_size
-        self.attention = nn.Linear(hidden_size, 1)
+class MultiHeadAttention(nn.Module):
+    def __init__(self, embed_dim, num_heads):
+        super(MultiHeadAttention, self).__init__()
+        self.multihead_attn = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
 
-    def forward(self, encoder_outputs):
-        attn_energies = self.attention(encoder_outputs).squeeze(-1)
-        attn_weights = F.softmax(attn_energies, dim=1)
-        attended = torch.bmm(attn_weights.unsqueeze(1), encoder_outputs).squeeze(1)
-        return attended
+    def forward(self, query, key, value, mask=None):
+        attn_output, attn_weights = self.multihead_attn(query, key, value, attn_mask=mask)
+        return attn_output, attn_weights
 
-
-class ModelArchitecture1(BaseModel):
-    def __init__(self, embedding_layer, num_classes, hidden_dim=128):
+class BLSTM2DCNNWithMultiHeadAttention(BaseModel):
+    def __init__(self, embedding_layer, num_classes, hidden_dim=128, num_heads=4):
         super().__init__()
         self.embedding = embedding_layer
         self.gaussian_noise = GaussianNoise(0.2)
         self.dropout_embed = nn.Dropout(0.5)
-
-        # BLSTM
-        self.blstm = nn.LSTM(
-            input_size=300,
-            hidden_size=hidden_dim,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.3
-        )
-
-        # CNN
-        self.conv = nn.Conv2d(1, 128, kernel_size=(3, 3), padding=1)
-        self.pool = nn.MaxPool2d(kernel_size=(2, 2))
-
-        # Self-attention
-        self.attention = nn.Linear(hidden_dim * 2, 1)
-
-        # Output
-        self.dropout_penultimate = nn.Dropout(0.2)
-        self.fc = nn.Linear(hidden_dim * 4, num_classes)
-        self._initialize_weights()
-
-    def forward(self, x):
-        # Embedding and noise
-        x = self.embedding(x)
-        x = self.gaussian_noise(x)
-        x = self.dropout_embed(x)
-
-        # BLSTM
-        lstm_out, _ = self.blstm(x)
-
-        # Self-attention
-        attention_weights = F.softmax(self.attention(lstm_out), dim=1)
-        attended = torch.bmm(attention_weights.transpose(1, 2), lstm_out)
-
-        # CNN
-        cnn_in = lstm_out.unsqueeze(1)
-        conv_out = self.conv(cnn_in)
-        conv_out = F.relu(conv_out)
-        conv_out = self.pool(conv_out)
-
-        # Combine features
-        batch_size = x.size(0)
-        conv_out = conv_out.view(batch_size, -1)
-        combined = torch.cat((attended.squeeze(1), conv_out), dim=1)
-
-        # Classification
-        combined = self.dropout_penultimate(combined)
-        out = self.fc(combined)
-
-        return out
-
-
-class ModelArchitecture2(BaseModel):
-    def __init__(self, embedding_layer, num_classes, hidden_dim=128):
-        super().__init__()
-        self.embedding = embedding_layer
-        self.gaussian_noise = GaussianNoise(0.2)
-        self.dropout_embed = nn.Dropout(0.5)
-
-        # Hierarchical attention
-        self.word_attention = nn.Linear(300, hidden_dim)
-        self.word_context = nn.Linear(hidden_dim, 1)
-
-        # BLSTM
-        self.blstm = nn.LSTM(
-            input_size=300,
-            hidden_size=hidden_dim,
-            batch_first=True,
-            bidirectional=True,
-            dropout=0.3
-        )
-
-        # Output
-        self.dropout_penultimate = nn.Dropout(0.2)
-        self.fc = nn.Linear(hidden_dim * 2, num_classes)
-        self._initialize_weights()
-
-    def forward(self, x):
-        # Embedding and noise
-        x = self.embedding(x)
-        x = self.gaussian_noise(x)
-        x = self.dropout_embed(x)
-
-        # Word-level attention
-        word_weights = torch.tanh(self.word_attention(x))
-        word_weights = self.word_context(word_weights)
-        word_weights = F.softmax(word_weights, dim=1)
-        word_vector = torch.bmm(word_weights.transpose(1, 2), x)
-
-        # BLSTM
-        lstm_out, _ = self.blstm(word_vector)
-
-        # Classification
-        final_state = lstm_out[:, -1, :]
-        final_state = self.dropout_penultimate(final_state)
-        out = self.fc(final_state)
-
-        return out
-
-class HierarchicalAttention(nn.Module):
-    def __init__(self, input_size, hidden_size):
-        super(HierarchicalAttention, self).__init__()
-        self.attention = nn.Linear(input_size, hidden_size)
-        self.context_vector = nn.Linear(hidden_size, 1, bias=False)
-
-    def forward(self, x):
-        # x shape: (batch_size, seq_len, input_size)
-        attn = torch.tanh(self.attention(x))  # (batch_size, seq_len, hidden_size)
-        attn_weights = F.softmax(self.context_vector(attn).squeeze(-1), dim=1)  # (batch_size, seq_len)
-        attended = torch.bmm(attn_weights.unsqueeze(1), x).squeeze(1)  # (batch_size, input_size)
-        return attended
-
-class BLSTMEncoder(nn.Module):
-    def __init__(self, embedding_dim, hidden_size):
-        super(BLSTMEncoder, self).__init__()
-        self.lstm = nn.LSTM(embedding_dim, hidden_size, bidirectional=True, batch_first=True)
-
-    def forward(self, embedded_text):
-        lstm_out, _ = self.lstm(embedded_text)
-        return lstm_out  # (batch_size, seq_len, hidden_size * 2)
-
-class ClassificationLayer(nn.Module):
-    def __init__(self, num_filters, num_classes):
-        super(ClassificationLayer, self).__init__()
-        # Ensure the input dim matches the number of filters after CNN + MaxPooling
-        self.fc = nn.Linear(num_filters, num_classes)  # num_filters should match the output from CNN+Pooling
-
-    def forward(self, pooled_out):
-        return self.fc(pooled_out)
-
-class CNNLayer(nn.Module):
-    def __init__(self, input_dim, num_filters, filter_size):
-        super(CNNLayer, self).__init__()
-        self.conv = nn.Conv1d(input_dim, num_filters, filter_size, padding=1)
-
-    def forward(self, lstm_out):
-        # lstm_out shape: (batch_size, seq_len, hidden_size * 2)
-        # Transpose to (batch_size, hidden_size * 2, seq_len) for 1D convolution
-        lstm_out = lstm_out.transpose(1, 2)
-        conv_out = self.conv(lstm_out)
-        return conv_out
-
-class MaxPoolingLayer(nn.Module):
-    def __init__(self, pool_size):
-        super(MaxPoolingLayer, self).__init__()
-        self.pool = nn.AdaptiveMaxPool1d(1)
-
-    def forward(self, conv_out):
-        pooled_out = self.pool(conv_out)
-        return pooled_out.squeeze(2)
-
-class BLSTM_CNN_Attention_Model(nn.Module):
-    def __init__(self, embedding_dim, hidden_size, num_filters, filter_size, pool_size, num_classes):
-        super(BLSTM_CNN_Attention_Model, self).__init__()
 
         # BLSTM layer
-        self.blstm = BLSTMEncoder(embedding_dim, hidden_size)
-
-        # Self-attention layer after BLSTM
-        self.self_attention = SelfAttention(hidden_size * 2)
-
-        # CNN layer
-        self.cnn = CNNLayer(hidden_size * 2, num_filters, filter_size)
-
-        # Max pooling layer
-        self.pool = MaxPoolingLayer(pool_size)
-
-        # Classification layer
-        self.classifier = ClassificationLayer(num_filters, num_classes)
-
-    def forward(self, input_embeddings):
-        # Step 1: Process through BLSTM
-        lstm_out = self.blstm(input_embeddings)
-
-        # Step 2: Apply self-attention after BLSTM
-        context_vector = self.self_attention(lstm_out)
-
-        # Step 3: Apply 2D convolution on the LSTM output
-        conv_out = self.cnn(lstm_out)
-
-        # Step 4: Max pooling
-        pooled_out = self.pool(conv_out)
-
-        # Step 5: Classification
-        logits = self.classifier(pooled_out)
-        return logits
-
-
-class BLSTM_CNN_Model(BaseModel):
-    def __init__(self, embedding_layer, num_classes, hidden_dim=128):
-        super().__init__()
-        self.embedding = embedding_layer
-        self.gaussian_noise = GaussianNoise(0.2)
-        self.dropout_embed = nn.Dropout(0.5)
-
-        # BLSTM
         self.blstm = nn.LSTM(
-            input_size=300,
+            input_size=embedding_layer.embedding_dim,
             hidden_size=hidden_dim,
+            num_layers=2,
             batch_first=True,
             bidirectional=True,
             dropout=0.3
         )
 
-        # CNN
-        self.conv = nn.Conv2d(1, 128, kernel_size=(3, 3), padding=1)
-        self.pool = nn.MaxPool2d(kernel_size=(2, 2))
+        # Multi-Head Attention
+        self.multihead_attn = nn.MultiheadAttention(
+            embed_dim=hidden_dim * 2,
+            num_heads=num_heads,
+            dropout=0.1,
+            batch_first=True
+        )
 
-        # Output
+        # CNN layers
+        self.conv1 = nn.Conv2d(1, 128, kernel_size=(3, hidden_dim * 2), padding=(1, 0))
+        self.pool = nn.MaxPool2d(kernel_size=(2, 1))
         self.dropout_penultimate = nn.Dropout(0.2)
-        cnn_output_size = self._get_conv_output_size(hidden_dim)
-        self.fc = nn.Linear(cnn_output_size, num_classes)
+
+        # Add adaptive pooling to ensure fixed output size
+        self.adaptive_pool = nn.AdaptiveAvgPool1d(8)  # Fixed output size
+
+        # Calculate fc_input_size based on fixed output dimensions
+        self.fc_input_size = 128 * 8  # 128 channels * 8 (adaptive pooling output size)
+
+        # Output layer
+        self.fc = nn.Linear(self.fc_input_size, num_classes)
         self._initialize_weights()
 
-    def _get_conv_output_size(self, hidden_dim):
-        x = torch.randn(1, 1, 64, hidden_dim * 2)
-        x = self.conv(x)
-        x = self.pool(x)
-        return x.numel()
+    def forward(self, x, lengths):
+        batch_size = x.size(0)
 
-    def forward(self, x):
         # Embedding and noise
-        x = self.embedding(x)
-        x = self.gaussian_noise(x)
-        x = self.dropout_embed(x)
+        x_embedded = self.embedding(x)
+        x_noisy = self.gaussian_noise(x_embedded)
+        x_embedded = self.dropout_embed(x_noisy)
+
+        # Pack sequence
+        packed_x = nn.utils.rnn.pack_padded_sequence(
+            x_embedded, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
 
         # BLSTM
-        lstm_out, _ = self.blstm(x)
+        packed_output, _ = self.blstm(packed_x)
+        lstm_out, _ = nn.utils.rnn.pad_packed_sequence(
+            packed_output, batch_first=True
+        )  # (batch_size, seq_len, hidden_dim * 2)
 
-        # CNN
-        cnn_in = lstm_out.unsqueeze(1)
-        conv_out = self.conv(cnn_in)
-        conv_out = F.relu(conv_out)
-        conv_out = self.pool(conv_out)
+        # Create attention mask for padding
+        mask = torch.arange(lstm_out.size(1), device=lstm_out.device)[None, :] >= lengths[:, None]
+
+        # Multi-Head Attention
+        attn_output, _ = self.multihead_attn(
+            lstm_out, lstm_out, lstm_out,
+            key_padding_mask=mask
+        )  # (batch_size, seq_len, hidden_dim * 2)
+
+        # Prepare for CNN
+        cnn_in = attn_output.unsqueeze(1)  # (batch_size, 1, seq_len, hidden_dim * 2)
+
+        # CNN layers
+        conv_out = F.relu(self.conv1(cnn_in))  # (batch_size, 128, seq_len, 1)
+        conv_out = self.pool(conv_out)  # (batch_size, 128, seq_len/2, 1)
+        conv_out = conv_out.squeeze(-1)  # (batch_size, 128, seq_len/2)
+
+        # Adaptive pooling to ensure fixed output size
+        conv_out = self.adaptive_pool(conv_out)  # (batch_size, 128, 8)
+
+        # Flatten and dropout
+        flattened = conv_out.view(batch_size, -1)  # (batch_size, 128 * 8)
+        dropped = self.dropout_penultimate(flattened)
 
         # Classification
-        batch_size = x.size(0)
-        conv_out = conv_out.view(batch_size, -1)
-        conv_out = self.dropout_penultimate(conv_out)
-        out = self.fc(conv_out)
+        output = self.fc(dropped)
 
-        return out
+        return output
+
+class HAN(nn.Module):
+    def __init__(self, embedding_layer=None, num_classes=None, vocab_size=None, embed_dim=None, hidden_dim=128, dropout=0.5):
+        super(HAN, self).__init__()
+
+        if embedding_layer is not None:
+            self.embedding = embedding_layer
+            embed_dim = embedding_layer.embedding_dim
+        else:
+            if vocab_size is None or embed_dim is None:
+                raise ValueError("vocab_size and embed_dim must be provided if embedding_layer is None")
+            self.embedding = nn.Embedding(vocab_size, embed_dim)
+
+        self.dropout = nn.Dropout(dropout)
+
+        # Word Encoder
+        self.word_lstm = nn.LSTM(embed_dim, hidden_dim, bidirectional=True, batch_first=True)
+        self.word_attention = nn.Linear(hidden_dim * 2, 1)
+
+        # Sentence Encoder
+        self.sentence_lstm = nn.LSTM(hidden_dim * 2, hidden_dim, bidirectional=True, batch_first=True)
+        self.sentence_attention = nn.Linear(hidden_dim * 2, 1)
+
+        # Classifier
+        if num_classes is None:
+            raise ValueError("num_classes must be provided")
+        self.fc = nn.Linear(hidden_dim * 2, num_classes)
+
+    def forward(self, x, lengths):
+        # x: (batch_size, seq_len)
+        batch_size = x.size(0)
+
+        # Embedding and dropout
+        embedded = self.embedding(x)  # (batch_size, seq_len, embed_dim)
+        embedded = self.dropout(embedded)
+
+        # Word Encoder
+        packed_embedded = nn.utils.rnn.pack_padded_sequence(
+            embedded, lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        packed_output, _ = self.word_lstm(packed_embedded)
+        word_out, _ = nn.utils.rnn.pad_packed_sequence(packed_output, batch_first=True)  # (batch_size, seq_len, hidden_dim*2)
+
+        # Word Attention
+        word_attn_scores = self.word_attention(word_out).squeeze(-1)  # (batch_size, seq_len)
+        word_attn_weights = F.softmax(word_attn_scores, dim=1).unsqueeze(-1)  # (batch_size, seq_len, 1)
+        word_context = word_out * word_attn_weights  # (batch_size, seq_len, hidden_dim*2)
+        word_representation = word_context.sum(dim=1)  # (batch_size, hidden_dim*2)
+
+        # Sentence Encoder (Assuming single sentence for simplicity)
+        sentence_input = word_representation.unsqueeze(1)  # (batch_size, 1, hidden_dim*2)
+        sentence_out, _ = self.sentence_lstm(sentence_input)  # (batch_size, 1, hidden_dim*2)
+
+        # Sentence Attention
+        sentence_attn_scores = self.sentence_attention(sentence_out).squeeze(-1)  # (batch_size, 1)
+        sentence_attn_weights = F.softmax(sentence_attn_scores, dim=1).unsqueeze(-1)  # (batch_size, 1, 1)
+        sentence_context = sentence_out * sentence_attn_weights  # (batch_size, 1, hidden_dim*2)
+        sentence_representation = sentence_context.sum(dim=1)  # (batch_size, hidden_dim*2)
+
+        # Classification
+        output = self.fc(sentence_representation)  # (batch_size, num_classes)
+        return output
