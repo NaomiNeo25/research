@@ -7,10 +7,10 @@
 #SBATCH --cpus-per-task=4
 ##SBATCH --gpus=1
 #SBATCH --mem=0  # Unlimited memory
-#SBATCH --time=2-00:00:00  # Unlimited time (format: days-hours:minutes)
+#SBATCH --time=2-00:00:00
 #SBATCH --job-name=IMDB
-#SBATCH -o /home-mscluster/nmuzamani2/research/output/IMDBslurm.%N.%j.out
-#SBATCH -e /home-mscluster/nmuzamani2/research/output/IMDBslurm.%N.%j.err
+#SBATCH -o /home-mscluster/nmuzamani2/research/output/IMDB.%N.%j.out
+#SBATCH -e /home-mscluster/nmuzamani2/research/output/IMDB.%N.%j.err
 
 
 export PATH=/usr/local/cuda-12.1/bin:$PATH

@@ -8,9 +8,9 @@
 ##SBATCH --gpus=1
 #SBATCH --mem=0  # Unlimited memory
 #SBATCH --time=20:00:00  # Unlimited time (format: days-hours:minutes)
-#SBATCH --job-name=Reuters
-#SBATCH -o /home-mscluster/nmuzamani2/research/output/Reutersslurm.%N.%j.out
-#SBATCH -e /home-mscluster/nmuzamani2/research/output/Reutersslurm.%N.%j.err
+#SBATCH --job-name=CCAT
+#SBATCH -o /home-mscluster/nmuzamani2/research/output/CCAT.%N.%j.out
+#SBATCH -e /home-mscluster/nmuzamani2/research/output/CCAT.%N.%j.err
 
 
 export PATH=/usr/local/cuda-12.1/bin:$PATH
@@ -20,4 +20,4 @@ export CUDA_HOME=/usr/local/cuda-12.1
 source /home-mscluster/nmuzamani2/anaconda3/etc/profile.d/conda.sh
 conda activate research
 
-srun python3 trainReuters.py
+srun python3 trainCCAT.py
