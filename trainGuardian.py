@@ -5,7 +5,7 @@ def run_training():
     trainer = Trainer(
         save_dir="./experiment_results",
         batch_size=64,
-        num_epochs=20,
+        num_epochs=50,
         embed_dim=300,
         hidden_dim=128
     )
@@ -18,7 +18,7 @@ def run_training():
     #     './datasets/Guardian'
     # ]
     dataset_folders = [
-        './../datasets/Guardian',
+        './datasets/Guardian',
     ]
 
     model_classes = [

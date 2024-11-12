@@ -6,12 +6,12 @@ def run_training():
     trainer = Trainer(
         save_dir="./experiment_results",
         batch_size=64,
-        num_epochs=20,
+        num_epochs=50,
         embed_dim=300,
         hidden_dim=128
     )
 
-    # Define dataset folders
+
     # dataset_folders = [
     #     './datasets/blogs',
     #     './datasets/CCAT50',
@@ -19,7 +19,7 @@ def run_training():
     #     './datasets/Guardian'
     # ]
     dataset_folders = [
-        './../datasets/blogs',
+        './datasets/IMDB62',
     ]
 
     model_classes = [
@@ -39,6 +39,7 @@ def run_training():
         BLSTM_CNN
     ]
 
+    # Run experiments
     results = trainer.run_experiment(model_classes, dataset_folders)
     return results
 

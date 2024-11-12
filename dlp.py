@@ -25,7 +25,7 @@ class TextDataset(Dataset):
 
         # Pad tokens
         padding_length = self.max_length - length
-        tokens = tokens + [0] * padding_length  # Assuming 0 is the padding index
+        tokens = tokens + [0] * padding_length
 
         tokens = torch.tensor(tokens, dtype=torch.long)
         length = torch.tensor(length, dtype=torch.long)
